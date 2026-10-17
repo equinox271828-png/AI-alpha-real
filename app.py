@@ -5,7 +5,7 @@ import streamlit as st
 # ---------- 配置 ----------
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 # 【修正1】智谱没有 glm-5.3-flash，改回你之前跑通的 glm-4.7-flash
-MODEL = "glm-4.7-flash" 
+MODEL = "glm-5.3-flash" 
 
 SYSTEM_PROMPT = """
 你叫Equinox，需要扮演这样的角色和用户说话
