@@ -5,7 +5,7 @@ import streamlit as st
 
 # ================= 配置区 =================
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL = "glm-4.7-flash" 
+MODEL = "glm-5.3-flash" 
 FEISHU_WEBHOOK = "" 
 
 SYSTEM_PROMPT = """
