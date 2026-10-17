@@ -1,11 +1,14 @@
 import json
 import requests
 import streamlit as st
+import random
 
-# ---------- 配置 ----------
+# ================= 配置区 =================
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-# 【修正1】智谱没有 glm-5.3-flash，改回你之前跑通的 glm-4.7-flash
 MODEL = "glm-5.3-flash" 
+
+# 填入你的飞书机器人 Webhook（如果没有，保持空字符串 ""）
+FEISHU_WEBHOOK = "" 
 
 SYSTEM_PROMPT = """
 你叫Equinox，需要扮演这样的角色和用户说话
@@ -24,18 +27,26 @@ SYSTEM_PROMPT = """
 Equinox：这种入门货……行吧，只写一遍。记得加 UA 和延时，别爬崩人家服务器还赖我。……注释写清楚了，看不懂再问——如果你真看不懂的话。
 """
 
-STARTERS = [
+# 扩充的随机题库
+STARTER_POOL = [
     "帮我写个爬虫",
     "用人话解释一下什么是闭包",
     "帮我看看这段代码哪里有问题",
     "我今天有点累……",
+    "教我怎么用 Python 处理 JSON",
+    "写一个正则表达式，用来匹配邮箱",
+    "我如果想学人工智能，下一步该学什么？",
+    "给我讲个冷笑话吧",
+    "帮我把这段代码改成一行",
+    "解释一下什么是 API"
 ]
 
 AVATARS = {"user": "🙂", "assistant": "🌗"}
+# ==========================================
 
 st.set_page_config(page_title="Equinox", page_icon="🌗", layout="centered")
 
-# ---------- 样式 ----------
+# ---------- 手机端优化与 UI 样式 ----------
 CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@1,9..144,500;1,9..144,600&family=Noto+Sans+SC:wght@400;500&display=swap');
@@ -44,8 +55,8 @@ CSS = """
   --bg: #0E1020;
   --panel: rgba(255,255,255,.045);
   --line: rgba(255,255,255,.08);
-  --text: #ECE8F2;
-  --muted: #9A97B3;
+  --text: #FFFFFF; /* 字体改为纯白 */
+  --muted: #CCCCCC; /* 副标题提亮 */
   --amber: #F2A65A;
   --coral: #F27878;
   --indigo: #7C74FF;
@@ -58,11 +69,25 @@ CSS = """
     var(--bg);
   font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
+
+/* 强制文字白色，提高对比度 */
+.stApp, .stMarkdown, p, span, div, label {
+    color: var(--text) !important;
+}
+
+/* 手机端适配：取消固定宽度，缩小边距 */
+.block-container { 
+    max-width: 100% !important; 
+    padding-top: 1.5rem !important; 
+    padding-bottom: 8rem !important; 
+    padding-left: 1rem !important; 
+    padding-right: 1rem !important; 
+}
+
 .stMarkdown, .stButton button, textarea { font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif; }
 
 header[data-testid="stHeader"] { background: transparent; }
 #MainMenu, footer { visibility: hidden; }
-.block-container { max-width: 760px; padding-top: 1.6rem; padding-bottom: 8rem; }
 
 .eq-hero { display: flex; align-items: center; gap: 16px; margin: .4rem 0 1.4rem; }
 .eq-mark {
@@ -74,7 +99,7 @@ header[data-testid="stHeader"] { background: transparent; }
   font-family: "Fraunces", Georgia, serif; font-style: italic; font-weight: 600;
   font-size: 2.15rem; line-height: 1.1; letter-spacing: .01em;
   background: linear-gradient(100deg, #FFD9A8, var(--amber) 45%, var(--coral));
-  -webkit-background-clip: text; background-clip: text; color: transparent;
+  -webkit-background-clip: text; background-clip: text; color: transparent !important;
 }
 .eq-pill {
   -webkit-text-fill-color: var(--muted);
@@ -88,13 +113,14 @@ header[data-testid="stHeader"] { background: transparent; }
 .eq-empty .big { font-family: "Fraunces", Georgia, serif; font-style: italic; font-size: 1.55rem; color: var(--text); }
 .eq-empty .small { color: var(--muted); font-size: .86rem; margin-top: 8px; }
 
+/* 聊天气泡适配手机屏幕 */
 [data-testid="stChatMessage"] {
   background: var(--panel); border: 1px solid var(--line); border-radius: 20px;
-  padding: 14px 18px; margin: 0 6% .7rem 0; backdrop-filter: blur(8px);
+  padding: 14px 18px; margin: 0 2% .7rem 0; backdrop-filter: blur(8px);
   color: var(--text); line-height: 1.7;
 }
 [data-testid="stChatMessage"]:has(.eq-user) {
-  flex-direction: row-reverse; margin: 0 0 .7rem 12%;
+  flex-direction: row-reverse; margin: 0 0 .7rem 2%;
   background: linear-gradient(135deg, rgba(242,166,90,.20), rgba(242,120,120,.12));
   border-color: rgba(242,166,90,.30);
 }
@@ -110,14 +136,14 @@ header[data-testid="stHeader"] { background: transparent; }
   transition: box-shadow .2s, border-color .2s;
 }
 [data-testid="stChatInput"]:focus-within { border-color: rgba(242,166,90,.7); box-shadow: 0 0 0 4px rgba(242,166,90,.12); }
-[data-testid="stChatInput"] textarea { color: var(--text); }
-[data-testid="stChatInput"] button { background: var(--amber); color: #1A1326; border-radius: 50%; }
+[data-testid="stChatInput"] textarea { color: var(--text) !important; }
+[data-testid="stChatInput"] button { background: var(--amber); color: #1A1326 !important; border-radius: 50%; }
 
 .stButton > button {
   border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: var(--panel);
   color: var(--text); padding: .55rem 1rem; transition: all .18s;
 }
-.stButton > button:hover { border-color: var(--amber); color: #FFD9A8; background: rgba(242,166,90,.08); transform: translateY(-1px); }
+.stButton > button:hover { border-color: var(--amber); color: #FFD9A8 !important; background: rgba(242,166,90,.08); transform: translateY(-1px); }
 
 section[data-testid="stSidebar"] { background: #12142A; border-right: 1px solid rgba(255,255,255,.06); }
 .eq-side-title { font-family: "Fraunces", Georgia, serif; font-style: italic; font-size: 1.25rem; color: var(--amber); margin-bottom: .2rem; }
@@ -161,20 +187,5 @@ def stream_response(messages):
     with requests.post(
         API_URL, headers=headers, json=data, stream=True, timeout=(10, 60)
     ) as response:
-        # 【修正2】如果 HTTP 状态码不是 200，抛出异常，由外部捕获
         if response.status_code != 200:
-            raise Exception(f"API返回错误码 {response.status_code}: {response.text}")
-            
-        for raw in response.iter_lines():
-            if not raw:
-                continue
-            line = raw.decode("utf-8")
-            if not line.startswith("data: "):
-                continue
-            payload = line[6:]
-            if payload == "[DONE]":
-                break
-            try:
-                chunk = json.loads(payload)
-                content = chunk["choices"][0]["delta"].get("content")
-            except (json.JSONDecodeErr
+            raise Exception(
