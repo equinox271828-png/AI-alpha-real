@@ -49,6 +49,7 @@ STARTER_POOL = [
     "学 AI 下一步该学啥？", "讲个冷笑话", "把代码改成一行", "解释什么是 API",
 ]
 AVATARS = {"user": "🙂", "assistant": "🌗"}
+# ====== 样式 ======
 CSS = """
 <style>
 :root {
@@ -90,11 +91,10 @@ section[data-testid="stSidebar"] { background: #12142A; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
-
 # ====== 密码门 ======
 if not st.session_state.get("pwd_ok"):
     st.markdown("### 🔒 Equinox 安全验证")
-    with st.form("gate"):  # 用表单：回车即可提交，输入时不会反复刷新页面
+    with st.form("gate"):
         pwd = st.text_input("请输入暗号进入：", type="password")
         submitted = st.form_submit_button("进入")
     if submitted:
@@ -115,7 +115,11 @@ st.markdown(
 api_key = get_secret("ZHIPU_API_KEY")
 if not api_key:
     st.error("请在 Secrets 配置 ZHIPU_API_KEY")
-    st.stop()class ApiError(Exception):
+    st.stop()
+
+
+# ====== 工具函数 ======
+class ApiError(Exception):
     def __init__(self, status):
         super().__init__(f"HTTP {status}")
         self.status = status
@@ -123,7 +127,6 @@ if not api_key:
 
 @st.cache_resource
 def get_session(key):
-    """全局复用同一个连接池：省掉每次提问重新握手(TCP+TLS)的时间。"""
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}"})
     s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=20))
@@ -132,7 +135,7 @@ def get_session(key):
 
 def init_chat():
     st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    st.session_state.starters = random.sample(STARTER_POOL, 4)  # 只抽一次，不会每次刷新都变
+    st.session_state.starters = random.sample(STARTER_POOL, 4)
 
 
 def render_message(role, content):
@@ -144,13 +147,12 @@ def render_message(role, content):
 
 def stream_response(messages):
     data = {"model": MODEL, "messages": messages, "stream": True, "temperature": 0.8}
-    # with：无论正常结束还是中途出错，连接都会被正确释放回连接池
     with get_session(api_key).post(API_URL, json=data, stream=True, timeout=(10, 60)) as res:
         if res.status_code != 200:
             raise ApiError(res.status_code)
 
         buf, last = [], time.monotonic()
-        for raw in res.iter_lines(chunk_size=None):  # 数据一到就处理，不攒包
+        for raw in res.iter_lines(chunk_size=None):
             if not raw or not raw.startswith(b"data: "):
                 continue
             payload = raw[6:]
@@ -159,11 +161,10 @@ def stream_response(messages):
             try:
                 delta = json.loads(payload)["choices"][0]["delta"]
             except (ValueError, KeyError, IndexError):
-                continue  # 统计块 / 格式异常的块直接跳过
+                continue
             piece = delta.get("content")
             if not piece:
                 continue
-            # 攒一小会儿再给界面：每个字都重绘一次很吃手机性能
             buf.append(piece)
             now = time.monotonic()
             if now - last >= FLUSH_INTERVAL:
@@ -172,6 +173,7 @@ def stream_response(messages):
                 last = now
         if buf:
             yield "".join(buf)
+# ====== 初始化 & 侧边栏 ======
 if "messages" not in st.session_state:
     init_chat()
 
@@ -191,7 +193,7 @@ if not prompt:
     prompt = st.session_state.pop("pending", None)
 
 msgs = st.session_state.messages
-history = msgs[1:]  # 去掉 system 人设
+history = msgs[1:]
 
 # ====== 空状态 / 历史 ======
 if not history and not prompt:
@@ -211,9 +213,10 @@ if not history and not prompt:
 
 for m in history:
     render_message(m["role"], m["content"])
+
+# ====== 处理新输入 ======
 if prompt:
     msgs.append({"role": "user", "content": prompt})
-    # 滑动窗口：保留首条人设 + 最近 MAX_CONTEXT 条，控制请求体积和首字延迟
     if len(msgs) > MAX_CONTEXT + 1:
         msgs[1:] = msgs[-MAX_CONTEXT:]
 
@@ -235,9 +238,9 @@ if prompt:
     if full_reply:
         msgs.append({"role": "assistant", "content": full_reply})
     else:
-        msgs.pop()  # 失败就撤回这条提问，避免历史里出现"只问不答"
+        msgs.pop()
 
-# 底部免责声明（放在最后，这样新消息出现在它上方）
+# 底部免责声明
 st.markdown(
     '<div style="text-align: center; color: #888888; font-size: 0.75rem; margin-top: 1rem;">'
     "Equinox 是 AI，她也可能会出错。</div>",
