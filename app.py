@@ -12,7 +12,7 @@ st.set_page_config(page_title="Equinox", page_icon="🌗", layout="centered")
 
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MODEL = "glm-4-flash"
-MAX_CONTEXT = 6        # 保留最近几条对话（3轮）
+MAX_CONTEXT = 20      # 保留最近几条对话（3轮）
 MAX_TOKENS = 1024      # 单次回复上限
 FLUSH_INTERVAL = 0.05  # 界面刷新间隔（秒）
 
