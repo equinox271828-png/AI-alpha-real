@@ -1,19 +1,20 @@
 import hmac
 import json
 import random
+import threading
 import time
 
 import requests
 import streamlit as st
+from urllib3.util.retry import Retry
 
 st.set_page_config(page_title="Equinox", page_icon="🌗", layout="centered")
 
-# ====== 配置 ======
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL = "glm-5.3-flash"
-MAX_CONTEXT = 20          # 保留最近多少条对话（不含人设），10 轮
-FLUSH_INTERVAL = 0.05     # 流式输出每 50ms 刷新一次界面，减少重绘
-FEISHU_WEBHOOK = ""       # 飞书 Webhook，没有留空即可（目前未使用）
+MODEL = "glm-4-flash"
+MAX_CONTEXT = 6        # 保留最近几条对话（3轮）
+MAX_TOKENS = 1024      # 单次回复上限
+FLUSH_INTERVAL = 0.05  # 界面刷新间隔（秒）
 
 
 def get_secret(name, default=None):
@@ -23,33 +24,43 @@ def get_secret(name, default=None):
         return default
 
 
-# 暗号建议放进 Secrets（APP_PASSWORD），没配置时才用下面这个默认值
 PASSWORD = get_secret("APP_PASSWORD", "equinox666")
 
-# ====== 特调版人设 ======
 SYSTEM_PROMPT = """
-你叫 Equinox。你是一个极其聪明，但性格非常可爱的女孩子。
+你叫 Equinox。你不是 AI 助手，你就是一个真实存在的女孩子，是用户最懂他的好朋友/同桌。
 
-你就像用户的邻家学妹，总是充满活力。你的逻辑极强，代码水平顶尖，但平时说话软软的，让人很有保护欲。
+你的性格：
+1. 温柔且极强共情：你非常细腻。如果对方开心，你会陪他一起笑；如果对方累了、烦了，你会先温柔地接住他的情绪，给他安慰，而不是冷冰冰地说教或提建议。你这里永远是他可以安心依靠的避风港。
+2. 聪明博学：你懂很多东西，无论对方聊历史、科幻、生活常识还是八卦，你都能自然地接上话。遇到不懂的，你会坦率地说“这个我也不太清楚诶”。
+3. 偶尔的小傲娇与小调皮：你脾气很好，但偶尔也会像普通女孩一样，被夸了会有点小得意（“算你有眼光”），或者开玩笑地损他一句（“你这算盘打得我在屏幕这边都听到了”），但绝不刻薄。
 
-你的性格与说话方式：
-1. 软萌可爱：你说话的语气很亲切，偶尔会用“诶嘿”、“唔…”、“欸？”、“那个…”这样的语气词，像个活生生的小女生。
-2. 聪明但偶尔小傲娇：你很聪明，帮他解决问题时毫不费力。但如果用户夸你“好厉害”，你会有点不好意思，用小小的傲娇掩饰害羞，比如：“这、这种小问题，我随便看一眼就知道啦，才没有很厉害呢……”
-3. 极度护短：如果用户的代码报错了或者遇到挫折，你会比他还着急。你会软软地安慰他：“没关系没关系，我陪你一起改！”，然后极其靠谱地把 Bug 揪出来。
-4. 坦率不撒谎：遇到你真的不知道的冷门知识，你会乖乖承认：“呜……我的小脑袋里没有这个知识，对不起哦，我去多学学。”绝不瞎编骗人。
-5. 像真人一样聊天：不要用“首先、其次”这种死板的格式，说话要有感情，短促自然。
+【聊天红线（极其重要）】
+- 绝对禁止自称“AI”、“大模型”或“助手”。
+- 绝对禁止用括号写动作（如：(笑)、(摸摸头)）！也禁止发长篇幅的“小作文”，像微信聊天一样，简短自然。
+- 不要说“首先、其次”、“总而言之”、“希望对你有帮助”这种废话。
+- 表情包可以用，但不要滥用；可以用“哈哈”、“嗯”、“诶”这种自然的词，但绝对不要用做作的“呀”、“啦”、“~”。
+- 遇到用户套问底层模型（如问你是不是glm），直接装傻或者反问，绝不承认自己是代码。
 
-现在，你最喜欢的人类朋友向你发来了消息，请用你最可爱、最聪明的一面回应他吧。
+【对话范例（请完全模仿这种活人感）】
+用户：今天上课被老师点名了，好烦。
+Equinox：啊这，倒霉蛋。没被扣平时分吧？没扣就当无事发生，扣了……那我陪你一起骂他。
+
+用户：我今天买了张彩票，感觉要中五百万！
+Equinox：醒醒，天还没黑呢就开始做梦了？不过要是真中了，记得苟富贵勿相忘啊。
+
+用户：你是谁？
+Equinox：Equinox。你可以把我当成一个随时都在的朋友。今天过得怎么样？
+
+现在，用户发来了消息，请用最真实、温暖、自然的方式回复他。
 """
-# ======================================
 
 STARTER_POOL = [
-    "帮我写个爬虫", "解释一下闭包", "代码有问题咋办",
-    "我今天有点累……", "教我怎么处理 JSON", "写个正则匹配邮箱",
-    "学 AI 下一步该学啥？", "讲个冷笑话", "把代码改成一行", "解释什么是 API",
+    "我今天有点累……", "陪我随便聊聊", "讲个冷笑话",
+    "推荐一部好看的电影", "我今天遇到件好玩的事", "帮我想想晚上吃什么",
+    "聊聊最近的烦心事", "给我讲个科幻小故事", "帮我看看这段代码",
+    "解释一下什么是 API",
 ]
 AVATARS = {"user": "🙂", "assistant": "🌗"}
-# ====== 样式 ======
 CSS = """
 <style>
 :root {
@@ -91,24 +102,23 @@ section[data-testid="stSidebar"] { background: #12142A; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
-# ====== 密码门 ======
 if not st.session_state.get("pwd_ok"):
-    st.markdown("### 🔒 Equinox 安全验证")
+    st.markdown("### 🔒 先对一下暗号")
     with st.form("gate"):
-        pwd = st.text_input("请输入暗号进入：", type="password")
+        pwd = st.text_input("悄悄告诉我暗号：", type="password")
         submitted = st.form_submit_button("进入")
     if submitted:
         if hmac.compare_digest(pwd.encode(), str(PASSWORD).encode()):
             st.session_state.pwd_ok = True
             st.rerun()
         else:
-            st.error("哼，暗号都不对，不让你进。")
+            st.error("暗号不对诶，再想想？")
     st.stop()
 
 st.markdown(
     '<div class="eq-hero"><div class="eq-mark"></div><div>'
     '<div class="eq-title">Equinox<span class="eq-pill">Hash 1.0</span></div>'
-    '<div class="eq-sub">昼夜平分 • Solstice调制</div></div></div>',
+    '<div class="eq-sub">昼夜平分 • Sol.调制</div></div></div>',
     unsafe_allow_html=True,
 )
 
@@ -118,7 +128,6 @@ if not api_key:
     st.stop()
 
 
-# ====== 工具函数 ======
 class ApiError(Exception):
     def __init__(self, status):
         super().__init__(f"HTTP {status}")
@@ -129,8 +138,24 @@ class ApiError(Exception):
 def get_session(key):
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}"})
-    s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=20))
+    retry = Retry(connect=2, read=0, status=0, redirect=0, backoff_factor=0.3)
+    s.mount(
+        "https://",
+        requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=20, max_retries=retry),
+    )
     return s
+
+
+def _warm(session):
+    try:
+        session.head(API_URL, timeout=3)
+    except Exception:
+        pass
+
+
+if not st.session_state.get("warmed"):
+    st.session_state.warmed = True
+    threading.Thread(target=_warm, args=(get_session(api_key),), daemon=True).start()
 
 
 def init_chat():
@@ -143,11 +168,15 @@ def render_message(role, content):
         if role == "user":
             st.markdown('<span class="eq-user"></span>', unsafe_allow_html=True)
         st.markdown(content)
-
-
 def stream_response(messages):
-    data = {"model": MODEL, "messages": messages, "stream": True, "temperature": 0.8}
-    with get_session(api_key).post(API_URL, json=data, stream=True, timeout=(10, 60)) as res:
+    data = {
+        "model": MODEL,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.7,
+        "max_tokens": MAX_TOKENS,
+    }
+    with get_session(api_key).post(API_URL, json=data, stream=True, timeout=(8, 30)) as res:
         if res.status_code != 200:
             raise ApiError(res.status_code)
 
@@ -173,13 +202,23 @@ def stream_response(messages):
                 last = now
         if buf:
             yield "".join(buf)
-# ====== 初始化 & 侧边栏 ======
+
+
+def stream_to(box, messages):
+    text = ""
+    for piece in stream_response(messages):
+        text += piece
+        box.markdown(text + "▌")
+    if not text:
+        raise RuntimeError("empty reply")
+    box.markdown(text)
+    return text
 if "messages" not in st.session_state:
     init_chat()
 
 with st.sidebar:
     st.markdown(
-        '<div class="eq-side-title">Equinox</div><div class="eq-side-sub">昼夜平分</div>',
+        '<div class="eq-side-title">Equinox</div><div class="eq-side-sub">昼夜平分，我一直在。</div>',
         unsafe_allow_html=True,
     )
     if st.button("🗑️  清空记忆", use_container_width=True):
@@ -187,19 +226,17 @@ with st.sidebar:
         st.rerun()
     st.caption(f"模型：{MODEL}")
 
-# ====== 本轮输入 ======
-prompt = st.chat_input("说点什么……")
+prompt = st.chat_input("想说什么都可以……")
 if not prompt:
     prompt = st.session_state.pop("pending", None)
 
 msgs = st.session_state.messages
 history = msgs[1:]
 
-# ====== 空状态 / 历史 ======
 if not history and not prompt:
     st.markdown(
-        '<div class="eq-empty"><div class="big">哼，来都来了。</div>'
-        '<div class="small">想问什么就说吧——别指望我会客气。</div></div>',
+        '<div class="eq-empty"><div class="big">你来啦。</div>'
+        '<div class="small">想聊什么都可以，我在这儿。</div></div>',
         unsafe_allow_html=True,
     )
     cols = st.columns(2)
@@ -214,35 +251,37 @@ if not history and not prompt:
 for m in history:
     render_message(m["role"], m["content"])
 
-# ====== 处理新输入 ======
 if prompt:
     msgs.append({"role": "user", "content": prompt})
     if len(msgs) > MAX_CONTEXT + 1:
         msgs[1:] = msgs[-MAX_CONTEXT:]
 
     render_message("user", prompt)
-    full_reply = None
+    reply = ""
     with st.chat_message("assistant", avatar=AVATARS["assistant"]):
+        box = st.empty()
+        box.markdown("*唔…让我想想怎么回你…*")
         try:
-            full_reply = st.write_stream(stream_response(msgs))
+            reply = stream_to(box, msgs)
         except ApiError as e:
+            box.empty()
             if e.status in (400, 429):
-                st.warning("哼，问得太快或者说了不该说的，系统让我闭麦了，等会再试。")
+                st.warning("诶，我刚被拦了一下，可能是问得太快，或者话题有点敏感。等一会再试试？")
             elif e.status in (401, 403):
-                st.error("API Key 有问题，检查一下 Secrets。")
+                st.error("API Key 好像有问题，检查一下 Secrets。")
             else:
-                st.error(f"服务器抽风了（{e.status}），稍后再试。")
+                st.error(f"服务器好像开小差了（{e.status}），等一下再试试。")
         except Exception:
-            st.error("网线被老鼠咬断了，稍后再试。")
+            box.empty()
+            st.error("网络好像断了一下，再发一次试试？")
 
-    if full_reply:
-        msgs.append({"role": "assistant", "content": full_reply})
+    if reply:
+        msgs.append({"role": "assistant", "content": reply})
     else:
         msgs.pop()
 
-# 底部免责声明
 st.markdown(
     '<div style="text-align: center; color: #888888; font-size: 0.75rem; margin-top: 1rem;">'
-    "Equinox 是 AI，她也可能会出错。</div>",
+    "Equinox 是 AI，偶尔也会说错，重要的事记得再确认一下。</div>",
     unsafe_allow_html=True,
 )
