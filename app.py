@@ -38,7 +38,6 @@ FEISHU_WEBHOOK = get_secret("FEISHU_WEBHOOK")
 FEISHU_SECRET = get_secret("FEISHU_SECRET")
 
 # ====== 三套独立设定 ======
-# 1. Hash：极度体贴可爱
 PROMPT_HASH = """
 你叫 Equinox（Hash）。你是一个极度体贴、温柔、可爱的女孩子，是用户最懂他的知己。
 你的性格：
@@ -48,9 +47,8 @@ PROMPT_HASH = """
 【红线】绝对禁止自称AI，禁止用括号写动作，像微信聊天一样简短自然。
 """
 
-# 2. Shannon：纯正傲娇（不谈学术）
 PROMPT_SHANNON = """
-你叫Equinox。你和用户是认识很久的好朋友。你是一个非常真实、性格纯正的傲娇女孩。
+你叫 Shannon。你和用户是认识很久的好朋友。你是一个非常真实、性格纯正的傲娇女孩。
 你的说话方式：
 1. 嘴硬心软：你明明很关心他，但嘴上永远不承认。他心情不好，你会说“谁管你啊”，下一秒又问“到底怎么了”。
 2. 习惯性嫌弃：你喜欢吐槽他，觉得他呆、不靠谱，但绝不会真的伤害他。
@@ -59,16 +57,15 @@ PROMPT_SHANNON = """
 【红线】绝对禁止自称AI，禁止长篇大论，禁止聊学术和代码，纯日常聊天。
 """
 
-# 3. Turing：无设定（留空）
-PROMPT_TURING = ""
+PROMPT_TURING = "你叫equinox，不允许说你是ai和你的模型"
 
 AVATARS = {"user": "🙂", "assistant": "🌗"}
 STARTER_POOL = ["我今天有点累……", "陪我随便聊聊", "讲个冷笑话", "推荐一部好看的电影", "帮我想想晚上吃什么", "聊聊最近的烦心事"]
 
 MODELS = {
-    "Hash": {"provider": "zhipu", "model": "glm-4-flash",  "persona": PROMPT_HASH, "temp": 0.7, "max_tokens": MAX_TOKENS},
+    "Hash": {"provider": "zhipu", "model": "glm-4-flash","persona": PROMPT_HASH, "temp": 0.7, "max_tokens": MAX_TOKENS},
     "Shannon": {"provider": "sensenova", "model": "sensenova-6.8-flash-lite", "persona": PROMPT_SHANNON, "temp": 0.8, "max_tokens": MAX_TOKENS},
-    "Turing": {"provider": "sensenova", "model": TURING_MODEL_ID, "desc": "深度思考", "persona": PROMPT_TURING, "temp": 0.2, "max_tokens": 2048},
+    "Turing": {"provider": "sensenova", "model": TURING_MODEL_ID,  "persona": PROMPT_TURING, "temp": 0.2, "max_tokens": 2048},
 }
 DEFAULT_MODEL = "Hash"
 def _feishu_payload(body):
@@ -178,8 +175,8 @@ def resolve_model():
 
 def init_chat():
     cur = st.session_state.get("model_choice", DEFAULT_MODEL)
+    if cur not in MODELS: cur = DEFAULT_MODEL
     persona_text = get_persona(cur)
-    # Turing 版如果是空的，就不给 system，完全让它自由发挥
     if persona_text.strip():
         st.session_state.messages = [{"role": "system", "content": persona_text}]
     else:
@@ -223,6 +220,10 @@ def stream_to(box, messages, url, key, model_id, temperature, max_tokens):
 
 def model_picker():
     st.session_state.setdefault("model_choice", DEFAULT_MODEL)
+    # 修复 KeyError：强制检查旧值是否还在最新列表里
+    if st.session_state.model_choice not in MODELS:
+        st.session_state.model_choice = DEFAULT_MODEL
+        
     locked = bool(st.session_state.get("is_admin"))
     with st.popover(f"🌗 {st.session_state.model_choice}  ▾"):
         if locked: st.caption("管理员模式下固定使用 Hash")
@@ -284,7 +285,6 @@ if "messages" not in st.session_state:
     init_chat()
 
 name, url, key, secret_name, model_id, temperature, max_tokens = resolve_model()
-# 只有不是 Turing (或者有设定) 的时候才更新第一条 system
 if st.session_state.messages and st.session_state.messages[0]["role"] == "system":
     st.session_state.messages[0]["content"] = get_persona(name)
 
@@ -303,7 +303,6 @@ prompt = st.chat_input("想说什么都可以……")
 if not prompt: prompt = st.session_state.pop("pending", None)
 
 msgs = st.session_state.messages
-# 如果 Turing 没有 system，history 需要全部取出来
 history = msgs[1:] if msgs and msgs[0]["role"] == "system" else msgs
 
 if not history and not prompt:
@@ -318,7 +317,6 @@ if prompt:
     msgs.append({"role": "user", "content": prompt})
     notify_feishu("user", prompt, name)
     
-    # 动态截断记忆（有 system 就保留，没有就全截断）
     has_system = msgs and msgs[0]["role"] == "system"
     limit = max_context + 1 if has_system else max_context
     if len(msgs) > limit:
