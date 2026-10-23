@@ -13,7 +13,8 @@ DS_URL = "https://token.sensenova.cn/v1"
 DS_KEY = st.secrets.get("DEEPSEEK_API_KEY", "") 
 
 # 3. Turing (中转站 GPT)
-GPT_URL = "https://4router.net/v1" 
+GPT_URL = "https://4router.net/openai：
+/v1/chat/completions" 
 GPT_KEY = st.secrets.get("GPT_API_KEY", "") 
 
 PASSWORD = "equinox666"
