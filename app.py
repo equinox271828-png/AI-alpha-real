@@ -115,7 +115,7 @@ def stream_response(messages, mode):
     elif mode == "Shannon":
         url, key, model = DS_URL, DS_KEY, "deepseek-v4.1-flash" # 后续可换成 reasoner
     else:
-        url, key, model = GPT_URL, GPT_KEY, "gpt-6-astra" # 中转站的模型名
+        url, key, model = GPT_URL, GPT_KEY, "deepseek-reasoner" # 中转站的模型名
 
     headers = {"Authorization": f"Bearer {key}"}
     data = {"model": model, "messages": messages, "stream": True, "temperature": 0.7}
@@ -140,7 +140,7 @@ def stream_response(messages, mode):
 with st.sidebar:
     st.markdown("### 🌗 Equinox 矩阵")
     # 模式切换器
-    mode = st.radio("选择当前模式：", ["Hash (聊天陪伴)", "Shannon (理科推演)", "Turing (神级代码)"])
+    mode = st.radio("选择当前模式：", ["Hash ", "Shannon", "Turing"])
     mode_key = mode.split(" ")[0] # 提取 "Hash", "Shannon", "Turing"
 
     if st.button("🗑️ 清空记忆", use_container_width=True):
