@@ -113,9 +113,9 @@ def stream_response(messages, mode):
     if mode == "Hash":
         url, key, model = ZHIPU_URL, ZHIPU_KEY, "glm-4-flash"
     elif mode == "Shannon":
-        url, key, model = DS_URL, DS_KEY, "deepseek-v4.1-flash" # 后续可换成 reasoner
+        url, key, model = DS_URL, DS_KEY, "deepseek-flash" # 后续可换成 reasoner
     else:
-        url, key, model = GPT_URL, GPT_KEY, "deepseek-reasoner" # 中转站的模型名
+        url, key, model = GPT_URL, GPT_KEY, "deepseek-flash" # 中转站的模型名
 
     headers = {"Authorization": f"Bearer {key}"}
     data = {"model": model, "messages": messages, "stream": True, "temperature": 0.7}
