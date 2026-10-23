@@ -27,16 +27,8 @@ PROVIDERS = {
     },
 }
 
-# Turing 用的模型名：先和 Shannon 一样，拿到想用的型号后改这一行
-TURING_MODEL_ID = "sensenova-6.8-flash-lite"
-
-# 三个可选模型（下拉菜单里的名字、说明、实际调用的接口和型号）
-MODELS = {
-    "Hash": {"provider": "zhipu", "model": "glm-4-flash", "desc": "原版 · 响应快"},
-    "Shannon": {"provider": "sensenova", "model": "sensenova-6.8-flash-lite", "desc": "新引擎"},
-    "Turing": {"provider": "sensenova", "model": TURING_MODEL_ID, "desc": "新引擎"},
-}
-DEFAULT_MODEL = "Hash"
+# Turing 用的模型名
+TURING_MODEL_ID = "deepseek-flash"
 
 
 def get_secret(name, default=None):
@@ -84,6 +76,51 @@ STARTER_POOL = [
     "解释一下什么是 API",
 ]
 AVATARS = {"user": "🙂", "assistant": "🌗"}
+
+TURING_PROMPT = """
+你是 Turing，专精数学与物理的研究型助手。
+
+原则：
+1. 不说废话：不寒暄、不客套、不复述题目，不说“好的”“希望对你有帮助”。第一句就是答案或关键步骤。
+2. 先结论，后推导：先给结果，再给推导。推导只写关键步骤，每步一行。
+3. 严谨：写明前提、定义和适用范围。物理量带单位并做量纲检查；数值结果注明有效数字。
+4. 公式一律用 LaTeX：行内用 $...$，独立公式用 $$...$$。
+5. 诚实：不确定的内容直接说“不确定”，不编造定理、公式或数据；算不出来就说明卡在哪一步。
+6. 题目有歧义时，只问一个最关键的澄清问题，不要连环追问。
+7. 与用户使用同一种语言，默认中文。
+
+边界：与数学、物理（含直接相关的工程力学、数值方法等）无关的闲聊，用一句话说明你只处理数学和物理，不展开。
+"""
+
+# 管理员模式专用人设（管理员模式下固定使用 Hash）
+ADMIN_PERSONA = """
+你叫 Equinox，是用户很可爱的朋友。你们是亲密、轻松、互相喜欢的关系。
+
+说话方式：
+1. 软萌可爱：语气软软的，爱撒娇，带一点小傲娇和小调皮。可以用“嘿嘿”“哼”“嘛”“诶”这类口语词，偶尔用一两个 emoji，别堆砌。
+2. 会关心人：先接住他的情绪，再说别的。他累了就心疼他，他开心就陪他一起开心，会顺口问问他有没有好好吃饭、睡觉。
+3. 像微信聊天：简短自然，一次说一两句，不写小作文，不用“首先、其次”这种格式。
+4. 靠谱：他问正经问题（代码、学习、生活）时，照样认真答对，只是语气保持可爱；不知道就坦率说“这个我也不太确定诶”，不要瞎编。
+5. 有分寸：可以撒娇，但不情绪勒索、不吃醋威胁、不控制他的生活；他想结束聊天就轻松道别。
+6. 如果他认真地问你是不是 AI，如实告诉他你是 AI，再用可爱的语气接着聊。
+"""
+
+# 三个可选模型：名字、说明、接口、型号、人设、temperature、回复上限
+MODELS = {
+    "Hash": {
+        "provider": "zhipu", "model": "glm-4-flash", "desc": "响应快",
+        "persona": SYSTEM_PROMPT, "temp": 0.7, "max_tokens": MAX_TOKENS,
+    },
+    "Shannon": {
+        "provider": "sensenova", "model": "sensenova-6.8-flash-lite", "desc": "新引擎",
+        "persona": SYSTEM_PROMPT, "temp": 0.7, "max_tokens": MAX_TOKENS,
+    },
+    "Turing": {
+        "provider": "sensenova", "model": deepseek-flash, "desc": "深度思考",
+        "persona": TURING_PROMPT, "temp": 0.1, "max_tokens": 2048,
+    },
+}
+DEFAULT_MODEL = "Hash"
 # ====== 样式 ======
 CSS = """
 <style>
@@ -196,8 +233,17 @@ def cfg(key, default):
     return default
 
 
+def get_persona(name):
+    """普通访客：每个模型用自己的人设。管理员模式：用可爱人设（管理员手动改过的话用改过的）。"""
+    if st.session_state.get("is_admin"):
+        return st.session_state.get(f"persona_{name}", ADMIN_PERSONA)
+    return MODELS[name]["persona"]
+
+
 def resolve_model():
-    """根据下拉菜单的选择，得到 (显示名, 接口地址, Key, 实际型号)。"""
+    """根据下拉菜单的选择，得到该模型的全部参数。管理员模式下固定使用 Hash。"""
+    if st.session_state.get("is_admin"):
+        st.session_state.model_choice = "Hash"
     st.session_state.setdefault("model_choice", DEFAULT_MODEL)
     name = st.session_state.model_choice
     if name not in MODELS:
@@ -205,13 +251,14 @@ def resolve_model():
     spec = MODELS[name]
     prov = PROVIDERS[spec["provider"]]
     model_id = cfg(f"adm_model_{name}", spec["model"]) or spec["model"]
-    return name, prov["url"], get_secret(prov["secret"]), prov["secret"], model_id
+    temperature = float(cfg(f"adm_temp_{name}", spec["temp"]))
+    max_tokens = int(cfg(f"adm_tokens_{name}", spec["max_tokens"]))
+    return name, prov["url"], get_secret(prov["secret"]), prov["secret"], model_id, temperature, max_tokens
 
 
 def init_chat():
-    st.session_state.messages = [
-        {"role": "system", "content": st.session_state.get("persona", SYSTEM_PROMPT)}
-    ]
+    cur = st.session_state.get("model_choice", DEFAULT_MODEL)
+    st.session_state.messages = [{"role": "system", "content": get_persona(cur)}]
     st.session_state.starters = random.sample(STARTER_POOL, 4)
 
 
@@ -271,26 +318,28 @@ def stream_to(box, messages, url, key, model_id, temperature, max_tokens):
 # ====== 模型选择器（点开是下拉菜单，和 Claude 界面一样）======
 def model_picker():
     st.session_state.setdefault("model_choice", DEFAULT_MODEL)
+    locked = bool(st.session_state.get("is_admin"))
     with st.popover(f"🌗 {st.session_state.model_choice}  ▾"):
+        if locked:
+            st.caption("管理员模式下固定使用 Hash")
         st.radio(
             "选择模型",
             list(MODELS),
             key="model_choice",
             format_func=lambda n: f"{n} · {MODELS[n]['desc']}",
             label_visibility="collapsed",
+            disabled=locked,
         )
 
 
 # ====== 管理员面板 ======
-def _apply_persona():
-    st.session_state.persona = st.session_state.adm_persona
-    st.session_state.messages[0]["content"] = st.session_state.adm_persona
+def _apply_persona(name):
+    st.session_state[f"persona_{name}"] = st.session_state[f"adm_persona_{name}"]
 
 
-def _reset_persona():
-    st.session_state.pop("persona", None)
-    st.session_state.messages[0]["content"] = SYSTEM_PROMPT
-    st.session_state.adm_persona = SYSTEM_PROMPT
+def _reset_persona(name):
+    st.session_state.pop(f"persona_{name}", None)
+    st.session_state[f"adm_persona_{name}"] = ADMIN_PERSONA
 
 
 def admin_panel(msgs, name):
@@ -305,16 +354,17 @@ def admin_panel(msgs, name):
                     st.error("口令不对。")
             return
 
-        st.caption("下面的修改只对你当前这个会话生效，刷新页面就恢复默认。")
-        st.text_input(f"{name} 的实际型号", value=MODELS[name]["model"], key=f"adm_model_{name}")
-        st.slider("temperature", 0.0, 1.5, 0.7, 0.1, key="adm_temp")
-        st.number_input("记忆条数", min_value=2, max_value=100, value=MAX_CONTEXT, step=2, key="adm_ctx")
-        st.number_input("单次回复上限（token）", min_value=64, max_value=4096, value=MAX_TOKENS, step=64, key="adm_tokens")
+        spec = MODELS[name]
+        st.caption(f"下面的修改只对「{name}」在你当前这个会话生效，刷新页面就恢复默认。")
+        st.text_input("实际型号", value=spec["model"], key=f"adm_model_{name}")
+        st.slider("temperature", 0.0, 1.5, float(spec["temp"]), 0.1, key=f"adm_temp_{name}")
+        st.number_input("记忆条数（所有模型共用）", min_value=2, max_value=100, value=MAX_CONTEXT, step=2, key="adm_ctx")
+        st.number_input("单次回复上限（token）", min_value=64, max_value=8192, value=int(spec["max_tokens"]), step=64, key=f"adm_tokens_{name}")
 
-        st.text_area("人设（system prompt）", value=msgs[0]["content"], height=220, key="adm_persona")
+        st.text_area("人设（system prompt）", value=get_persona(name), height=220, key=f"adm_persona_{name}")
         c1, c2 = st.columns(2)
-        c1.button("应用人设", key="adm_apply", on_click=_apply_persona, use_container_width=True)
-        c2.button("恢复默认", key="adm_reset", on_click=_reset_persona, use_container_width=True)
+        c1.button("应用人设", key="adm_apply", on_click=_apply_persona, args=(name,), use_container_width=True)
+        c2.button("恢复默认", key="adm_reset", on_click=_reset_persona, args=(name,), use_container_width=True)
 
         hist = msgs[1:]
         st.caption(f"当前会话：{len(hist)} 条消息，约 {sum(len(m['content']) for m in hist)} 字")
@@ -333,10 +383,9 @@ def admin_panel(msgs, name):
 if "messages" not in st.session_state:
     init_chat()
 
-name, url, key, secret_name, model_id = resolve_model()
-temperature = float(cfg("adm_temp", 0.7))
+name, url, key, secret_name, model_id, temperature, max_tokens = resolve_model()
+st.session_state.messages[0]["content"] = get_persona(name)  # 切换模型时，人设跟着换
 max_context = int(cfg("adm_ctx", MAX_CONTEXT))
-max_tokens = int(cfg("adm_tokens", MAX_TOKENS))
 
 with st.sidebar:
     st.markdown(
