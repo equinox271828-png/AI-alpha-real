@@ -116,7 +116,7 @@ MODELS = {
         "persona": SYSTEM_PROMPT, "temp": 0.7, "max_tokens": MAX_TOKENS,
     },
     "Turing": {
-        "provider": "sensenova", "model": deepseek-flash, "desc": "深度思考",
+        "provider": "sensenova", "model": TURING_MODEL_ID, "desc": "深度思考",
         "persona": TURING_PROMPT, "temp": 0.1, "max_tokens": 2048,
     },
 }
@@ -180,7 +180,7 @@ if not st.session_state.get("pwd_ok"):
 st.markdown(
     '<div class="eq-hero"><div class="eq-mark"></div><div>'
     '<div class="eq-title">Equinox<span class="eq-pill">Hash 1.0</span></div>'
-    '<div class="eq-sub">昼夜平分 • Sol.调制</div></div></div>',
+    '<div class="eq-sub">昼夜平分</div></div></div>',
     unsafe_allow_html=True,
 )
 
