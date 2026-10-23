@@ -28,7 +28,7 @@ PROVIDERS = {
 }
 
 # Turing 用的模型名
-TURING_MODEL_ID = "deepseek-flash"
+TURING_MODEL_ID = "deepseek-v4-flash"
 
 
 def get_secret(name, default=None):
