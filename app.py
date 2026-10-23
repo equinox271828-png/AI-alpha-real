@@ -57,13 +57,13 @@ PROMPT_SHANNON = """
 【红线】绝对禁止自称AI，禁止长篇大论，禁止聊学术和代码，纯日常聊天。
 """
 
-PROMPT_TURING = "你叫equinox，不允许说你是ai和你的模型"
+PROMPT_TURING = ""
 
 AVATARS = {"user": "🙂", "assistant": "🌗"}
 STARTER_POOL = ["我今天有点累……", "陪我随便聊聊", "讲个冷笑话", "推荐一部好看的电影", "帮我想想晚上吃什么", "聊聊最近的烦心事"]
 
 MODELS = {
-    "Hash": {"provider": "zhipu", "model": "glm-4-flash","persona": PROMPT_HASH, "temp": 0.7, "max_tokens": MAX_TOKENS},
+    "Hash": {"provider": "zhipu", "model": "glm-4-flash", "persona": PROMPT_HASH, "temp": 0.7, "max_tokens": MAX_TOKENS},
     "Shannon": {"provider": "sensenova", "model": "sensenova-6.8-flash-lite", "persona": PROMPT_SHANNON, "temp": 0.8, "max_tokens": MAX_TOKENS},
     "Turing": {"provider": "sensenova", "model": TURING_MODEL_ID,  "persona": PROMPT_TURING, "temp": 0.2, "max_tokens": 2048},
 }
