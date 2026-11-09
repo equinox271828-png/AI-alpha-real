@@ -39,7 +39,7 @@ def get_secret(name, default=None):
         return default
 
 
-PASSWORD = get_secret("APP_PASSWORD", "equinox666")
+PASSWORD = get_secret("APP_PASSWORD", "2.71828")
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD", "equinox-admin")
 # ====== 飞书群机器人配置 ======
 FEISHU_WEBHOOK = get_secret("FEISHU_WEBHOOK")
