@@ -17,6 +17,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
 # ====== 读取 Secrets ======
 def plain(x):
     """把 st.secrets 里的嵌套对象转成普通 dict/list。"""
@@ -42,15 +43,29 @@ DAILY_TOKEN_LIMIT = int(secret("DAILY_TOKEN_LIMIT", 8192))
 MAX_CONTEXT = int(secret("MAX_CONTEXT", 20))
 SYSTEM_PROMPT = str(secret("SYSTEM_PROMPT", "") or "")   # 人设空位
 
-RELAY_BASE_URL = str(secret("RELAY_BASE_URL", "") or "").rstrip("/")
-RELAY_API_KEY = secret("RELAY_API_KEY")
-
 FEISHU_WEBHOOK = secret("FEISHU_WEBHOOK")
 FEISHU_SECRET = secret("FEISHU_SECRET")
 
 _sb = secret("supabase", {}) or {}
-SB_URL = str(_sb.get("url", "")).rstrip("/")
-SB_KEY = _sb.get("key", "")
+SB_URL = str(_sb.get("url", "")).strip().rstrip("/")
+if SB_URL.endswith("/rest/v1"):                   # 兼容带 /rest/v1 的写法
+    SB_URL = SB_URL[: -len("/rest/v1")]
+SB_KEY = str(_sb.get("key", "")).strip()
+
+
+def to_chat_url(base):
+    """填到 /v1 为止即可，自动补 /chat/completions。"""
+    base = str(base or "").rstrip("/")
+    if not base or base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+# 每家接口提供方：{"relay": {"url": ..., "key": ...}, ...}
+PROVIDERS = {
+    k: {"url": to_chat_url(v.get("base_url")), "key": v.get("api_key")}
+    for k, v in (secret("providers", {}) or {}).items()
+}
 
 # 模型表：全部来自 Secrets 的 [[models]]
 MODELS = []
@@ -59,6 +74,7 @@ for _m in secret("models", []) or []:
         MODELS.append({
             "name": str(_m["name"]),
             "id": str(_m["id"]),
+            "provider": str(_m.get("provider", "relay")),
             "limited": bool(_m.get("limited", False)),
             "temp": float(_m.get("temp", 0.7)),
             "max_tokens": int(_m.get("max_tokens", 2048)),
@@ -67,13 +83,6 @@ for _m in secret("models", []) or []:
 MODEL_MAP = {m["name"]: m for m in MODELS}
 
 TZ = timezone(timedelta(hours=8))   # 额度按北京时间每天 0 点重置
-
-
-def chat_url():
-    """中转站地址：填到 /v1 为止即可，会自动补 /chat/completions。"""
-    if RELAY_BASE_URL.endswith("/chat/completions"):
-        return RELAY_BASE_URL
-    return RELAY_BASE_URL + "/chat/completions"
 
 
 def est_tokens(s):
@@ -86,20 +95,24 @@ def est_tokens(s):
 def get_jobs():
     """跨会话共享的生成任务表：{job_id: {...}}。"""
     return {}
+
+
 # ====== Supabase（REST 接口） ======
 def sb_ok():
     return bool(SB_URL and SB_KEY)
 
 
 def sb(method, table, params=None, body=None):
+    headers = {
+        "apikey": SB_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    if SB_KEY.startswith("eyJ"):          # 旧版 JWT 密钥才需要 Authorization
+        headers["Authorization"] = f"Bearer {SB_KEY}"
     r = requests.request(
-        method, f"{SB_URL}/rest/v1/{table}", params=params, json=body, timeout=8,
-        headers={
-            "apikey": SB_KEY,
-            "Authorization": f"Bearer {SB_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal",
-        },
+        method, f"{SB_URL}/rest/v1/{table}",
+        params=params, json=body, timeout=8, headers=headers,
     )
     r.raise_for_status()
     return r.json() if method == "GET" else None
@@ -193,6 +206,8 @@ def notify_feishu(role, text, model, user, sid):
     who = f"🙂 {user}" if role == "user" else "🌗 Equinox"
     body = f"【Equinox】{who} · {model} · #{sid[:6]}\n{text[:3000]}"
     threading.Thread(target=_post_feishu, args=(feishu_payload(body),), daemon=True).start()
+
+
 # ====== 调用模型（后台线程，流式） ======
 class ApiError(Exception):
     def __init__(self, status):
@@ -202,13 +217,13 @@ class ApiError(Exception):
 
 def api_error_text(status):
     if status in (401, 403):
-        return "中转站 Key 无效或没权限，请检查 Secrets。"
+        return "接口 Key 无效或没权限，请检查 Secrets。"
     if status == 404:
         return "找不到这个模型，请检查 Secrets 里该模型的 id。"
     if status == 400:
         return "请求被拒绝（400），可能是型号名不对，或内容被拦截。"
     if status == 429:
-        return "请求太频繁，或中转站余额不足，稍后再试。"
+        return "请求太频繁，或接口余额不足，稍后再试。"
     return f"服务器开小差了（{status}），稍后再试。"
 
 
@@ -223,13 +238,13 @@ def run_job(job, url, key, body_base, meta):
         for attempt in (0, 1):
             body = dict(body_base)
             if attempt == 0:
-                body["stream_options"] = {"include_usage": True}   # 让中转站返回真实 token 用量
+                body["stream_options"] = {"include_usage": True}   # 让接口返回真实 token 用量
             with requests.post(
                 url, headers={"Authorization": f"Bearer {key}"},
                 json=body, stream=True, timeout=(8, 90),
             ) as res:
                 if res.status_code == 400 and attempt == 0:
-                    continue        # 个别中转站不认 stream_options，去掉重试一次
+                    continue        # 个别接口不认 stream_options，去掉重试一次
                 if res.status_code != 200:
                     raise ApiError(res.status_code)
                 for raw in res.iter_lines(chunk_size=None):
@@ -271,6 +286,8 @@ def run_job(job, url, key, body_base, meta):
                     job["save_failed"] = True
             notify_feishu("assistant", text, meta["model"], meta["user"], meta["sid"])
         job["done"] = True
+
+
 # ====== 会话状态 ======
 def notify(text, restore=None):
     """给前端弹一个提示；restore 表示把没发出去的文字还给输入框。"""
@@ -361,8 +378,9 @@ def on_send(text, model_name):
     if not spec:
         notify("没有这个模型。", text)
         return True
-    if not (RELAY_BASE_URL and RELAY_API_KEY):
-        notify("中转站还没配置（RELAY_BASE_URL / RELAY_API_KEY）。", text)
+    prov = PROVIDERS.get(spec["provider"])
+    if not (prov and prov["url"] and prov["key"]):
+        notify(f"{model_name} 的接口还没配置（providers.{spec['provider']}）。", text)
         return True
 
     # 额度检查：只限制「受限模型」，无限额度账号跳过
@@ -405,7 +423,7 @@ def on_send(text, model_name):
     get_jobs()[jid] = job
     threading.Thread(
         target=run_job,
-        args=(job, chat_url(), RELAY_API_KEY, body, {"user": user, "sid": ss.sid, "model": model_name}),
+        args=(job, prov["url"], prov["key"], body, {"user": user, "sid": ss.sid, "model": model_name}),
         daemon=True,
     ).start()
     ss.job_id = jid
@@ -516,4 +534,36 @@ def build_state():
     }
 
 
+# ====== 隐藏 Streamlit 自带界面，让自定义前端铺满屏幕 ======
+CSS = """
+<style>
+html, body, .stApp, [data-testid="stAppViewContainer"] { background:#FAF9F5 !important; overflow:hidden !important; }
+@media (prefers-color-scheme: dark) {
+  html, body, .stApp, [data-testid="stAppViewContainer"] { background:#262624 !important; }
+}
+header, footer, #MainMenu, [data-testid="stHeader"], [data-testid="stToolbar"],
+[data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"],
+[data-testid="collapsedControl"], [data-testid="stDecoration"],
+[data-testid="stStatusWidget"] { display:none !important; }
+.block-container { padding:0 !important; max-width:100% !important; }
+[data-stale="true"], [data-testid="stElementContainer"] { opacity:1 !important; transition:none !important; }
+iframe[title*="equinox_ui"], iframe[data-testid="stCustomComponentV1"] {
+  position:fixed !important; inset:0 !important; width:100vw !important;
+  height:100dvh !important; border:0 !important; z-index:1000 !important;
+}
+</style>
+"""
 
+_ui = components.declare_component(
+    "equinox_ui", path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat_ui")
+)
+
+st.markdown(CSS, unsafe_allow_html=True)
+state = build_state()
+ev = _ui(state=state, key="equinox_ui", default=None)
+
+# 每个事件只处理一次（用 eid 去重），处理完重新运行以刷新界面
+if ev and ev.get("eid") != st.session_state.get("last_eid"):
+    st.session_state.last_eid = ev["eid"]
+    if handle(ev):
+        st.rerun()
