@@ -114,7 +114,8 @@ def sb(method, table, params=None, body=None):
         method, f"{SB_URL}/rest/v1/{table}",
         params=params, json=body, timeout=8, headers=headers,
     )
-    r.raise_for_status()
+    if not r.ok:                          # 显示具体错误，方便排查
+        raise RuntimeError(f"{r.status_code} {r.text[:150]}")
     return r.json() if method == "GET" else None
 
 
@@ -342,8 +343,8 @@ def refresh_side(user):
     try:
         ss.sessions = db_sessions(user)
         ss.used = db_used(user)
-    except Exception:
-        notify("读取历史/额度失败，请检查 Supabase 配置。")
+    except Exception as e:
+        notify(f"读取历史/额度失败：{str(e)[:150]}")
 
 
 # ====== 事件处理（前端点了什么，在这里响应） ======
@@ -390,8 +391,8 @@ def on_send(text, model_name):
             return True
         try:
             used = db_used(user)
-        except Exception:
-            notify("额度服务暂时不可用，请稍后再试。", text)
+        except Exception as e:
+            notify(f"额度服务暂时不可用：{str(e)[:120]}", text)
             return True
         if used >= DAILY_TOKEN_LIMIT:
             notify(f"今天的额度用完了（{used}/{DAILY_TOKEN_LIMIT} tokens），明天恢复；也可以换 GLM / DeepSeek。", text)
@@ -405,8 +406,8 @@ def on_send(text, model_name):
                 "username": user, "session_id": ss.sid, "role": "user",
                 "content": text, "model": model_name, "tokens": est_tokens(text),
             }])
-        except Exception:
-            notify("这条消息没能存档，刷新后可能丢失。")
+        except Exception as e:
+            notify(f"这条消息没能存档：{str(e)[:120]}")
     notify_feishu("user", text, model_name, user, ss.sid)
 
     # 组装上下文：人设（可空）+ 最近 N 条
@@ -459,8 +460,8 @@ def handle(ev):
                 return False
             try:
                 rows = db_load(user, sid)
-            except Exception:
-                notify("读取对话失败。")
+            except Exception as e:
+                notify(f"读取对话失败：{str(e)[:120]}")
                 return True
             detach_job()
             ss.sid, ss.messages = sid, rows
@@ -469,8 +470,8 @@ def handle(ev):
         sid = ev.get("sid")
         try:
             db_delete(user, sid)
-        except Exception:
-            notify("删除失败。")
+        except Exception as e:
+            notify(f"删除失败：{str(e)[:120]}")
             return True
         if sid == ss.sid:
             new_chat()
@@ -488,8 +489,8 @@ def handle(ev):
         if t in ("admin_open", "admin_refresh"):
             try:
                 ss.admin = {"rows": db_overview(), "msg": ""}
-            except Exception:
-                ss.admin = {"rows": [], "msg": "读取用量失败，请检查 Supabase。"}
+            except Exception as e:
+                ss.admin = {"rows": [], "msg": f"读取用量失败：{str(e)[:120]}"}
             return True
         if t == "admin_close":
             ss.admin = None
