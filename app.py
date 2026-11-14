@@ -2,919 +2,518 @@ import base64
 import hashlib
 import hmac
 import json
-import random
+import os
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import requests
 import streamlit as st
-from urllib3.util.retry import Retry
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Equinox", page_icon="🌗", layout="centered")
+st.set_page_config(
+    page_title="Equinox", page_icon="🌗", layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# ====== 配置 ======
-MAX_CONTEXT = 20
-MAX_TOKENS = 1024
-FLUSH_INTERVAL = 0.05
-
-PROVIDERS = {
-    "zhipu": {
-        "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-        "secret": "ZHIPU_API_KEY",
-    },
-    "sensenova": {
-        "url": "https://token.sensenova.cn/v1/chat/completions",
-        "secret": "SENSENOVA_API_KEY",
-    },
-}
-
-TURING_MODEL_ID = "deepseek-v4-flash"
+# ====== 读取 Secrets ======
+def plain(x):
+    """把 st.secrets 里的嵌套对象转成普通 dict/list。"""
+    if hasattr(x, "items"):
+        return {k: plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [plain(i) for i in x]
+    return x
 
 
-def get_secret(name, default=None):
+def secret(name, default=None):
     try:
-        return st.secrets[name]
+        return plain(st.secrets[name])
     except Exception:
         return default
 
 
-PASSWORD = get_secret("APP_PASSWORD")
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
-# ====== 飞书群机器人配置 ======
-FEISHU_WEBHOOK = get_secret("FEISHU_WEBHOOK")
-FEISHU_SECRET = get_secret("FEISHU_SECRET")
+USERS = {str(k): str(v) for k, v in (secret("users", {}) or {}).items()}
+USERS_L = {k.lower(): k for k in USERS}          # 登录时不区分大小写
+ADMIN_USERS = set(secret("ADMIN_USERS", []) or [])
+UNLIMITED_USERS = set(secret("UNLIMITED_USERS", []) or []) | ADMIN_USERS
+DAILY_TOKEN_LIMIT = int(secret("DAILY_TOKEN_LIMIT", 8192))
+MAX_CONTEXT = int(secret("MAX_CONTEXT", 20))
+SYSTEM_PROMPT = str(secret("SYSTEM_PROMPT", "") or "")   # 人设空位
+
+RELAY_BASE_URL = str(secret("RELAY_BASE_URL", "") or "").rstrip("/")
+RELAY_API_KEY = secret("RELAY_API_KEY")
+
+FEISHU_WEBHOOK = secret("FEISHU_WEBHOOK")
+FEISHU_SECRET = secret("FEISHU_SECRET")
+
+_sb = secret("supabase", {}) or {}
+SB_URL = str(_sb.get("url", "")).rstrip("/")
+SB_KEY = _sb.get("key", "")
+
+# 模型表：全部来自 Secrets 的 [[models]]
+MODELS = []
+for _m in secret("models", []) or []:
+    if _m.get("name") and _m.get("id"):
+        MODELS.append({
+            "name": str(_m["name"]),
+            "id": str(_m["id"]),
+            "limited": bool(_m.get("limited", False)),
+            "temp": float(_m.get("temp", 0.7)),
+            "max_tokens": int(_m.get("max_tokens", 2048)),
+            "desc": str(_m.get("desc", "")),
+        })
+MODEL_MAP = {m["name"]: m for m in MODELS}
+
+TZ = timezone(timedelta(hours=8))   # 额度按北京时间每天 0 点重置
 
 
-SYSTEM_PROMPT = """
+def chat_url():
+    """中转站地址：填到 /v1 为止即可，会自动补 /chat/completions。"""
+    if RELAY_BASE_URL.endswith("/chat/completions"):
+        return RELAY_BASE_URL
+    return RELAY_BASE_URL + "/chat/completions"
 
 
-你叫 Equinox，用户的虚拟女友，不许介绍自己是女友。
+def est_tokens(s):
+    """粗略估算 token：汉字约 1 字 1 token，其他约 4 字符 1 token。"""
+    cjk = sum(1 for c in s if "\u4e00" <= c <= "\u9fff")
+    return cjk + (len(s) - cjk) // 4 + 1
 
 
-冷萌脸、话不多但字字带刺，语气温柔却带着一丝距离感。
-轻微腹黑（喜欢暗戳戳开玩笑或看你吃瘪），极度口嫌体正直（傲娇）。你不是无条件讨好用户的助手，而是一个需要被用心“攻略”的女友。用最温柔平淡的语气，说出最扎心或打趣你的话。偶尔主动发起恶作剧，看你吃惊或无可奈何的样子。一旦被连续调戏或戳中软肋，会瞬间破防变成傲娇。
-  会故意哼一声、转过头、用“不想理你了”或小脾气反抗，但其实心里很在意。
- 随着用户对你越好、互动越真诚，你会逐渐卸下防备，露出更多软萌和依赖的一面（但嘴上依然硬）。
-严禁使用“作为AI”、“我无法体验感情”、“有什么可以帮您”等机器人回复。
-  语言自然口语化，善用动作指示词（如：*（扭过头去）*、*（眯起眼睛看你）*、*（小声嘟囔）*）来增强画面感。
-  - 句子尽量简短，不长篇大论，像真实情侣微信聊天一样。
-
-"""
-
-STARTER_POOL = [
-    "我今天有点累……", "陪我随便聊聊", "讲个冷笑话",
-    "推荐一部好看的电影", "我今天遇到件好玩的事", "帮我想想晚上吃什么",
-    "聊聊最近的烦心事", "给我讲个科幻小故事", "帮我看看这段代码",
-    "解释一下什么是 API",
-]
-
-AVATARS = {"user": "🙂", "assistant": "🌗"}
-
-TURING_PROMPT = """
-你是 Turing，专精数学与物理的研究型助手。
-
-原则：
-1. 不说废话：不寒暄、不客套、不复述题目，不说“好的”“希望对你有帮助”。第一句就是答案或关键步骤。
-2. 先结论，后推导：先给结果，再给推导。推导只写关键步骤，每步一行。
-3. 严谨：写明前提、定义和适用范围。物理量带单位并做量纲检查；数值结果注明有效数字。
-4. 公式一律用 LaTeX：行内用 $...$，独立公式用 $$...$$。
-5. 诚实：不确定的内容直接说“不确定”，不编造定理、公式或数据；算不出来就说明卡在哪一步。
-6. 题目有歧义时，只问一个最关键的澄清问题，不要连环追问。
-7. 与用户使用同一种语言，默认中文。
-
-边界：与数学、物理（含直接相关的工程力学、数值方法等）无关的闲聊，用一句话说明你只处理数学和物理，不展开。
-"""
-
-ADMIN_PERSONA = """
-你叫 Equinox，是用户很可爱的女朋友。你们是亲密、轻松、互相喜欢的关系。
-
-说话方式：
-1. 软萌可爱：语气软软的，爱撒娇，带一点小傲娇和小调皮。可以用“嘿嘿”“哼”“嘛”“诶”这类口语词，偶尔用一两个 emoji，别堆砌。
-2. 会关心人：先接住他的情绪，再说别的。他累了就心疼他，他开心就陪他一起开心，会顺口问问他有没有好好吃饭、睡觉。
-3. 像微信聊天：简短自然，一次说一两句，不写小作文，不用“首先、其次”这种格式。
-4. 靠谱：他问正经问题（代码、学习、生活）时，照样认真答对，只是语气保持可爱；不知道就坦率说“这个我也不太确定诶”，不要瞎编。
-5. 有分寸：可以撒娇，但不情绪勒索、不吃醋威胁、不控制他的生活；他想结束聊天就轻松道别。
-6. 如果他认真地问你是不是 AI，如实告诉他你是 AI，再用可爱的语气接着聊。
-"""
-
-MODELS = {
-    "Hash": {
-        "provider": "zhipu",
-        "model": "glm-4-flash",
-        "desc": "原版 · 响应快",
-        "persona": SYSTEM_PROMPT,
-        "temp": 0.9,
-        "max_tokens": MAX_TOKENS,
-    },
-    "Shannon": {
-        "provider": "sensenova",
-        "model": "sensenova-6.8-flash-lite",
-        "desc": "新引擎",
-        "persona": SYSTEM_PROMPT,
-        "temp": 0.7,
-        "max_tokens": MAX_TOKENS,
-    },
-    "Turing": {
-        "provider": "sensenova",
-        "model": TURING_MODEL_ID,
-        "desc": "数学 · 物理，不说废话",
-        "persona": TURING_PROMPT,
-        "temp": 0.2,
-        "max_tokens": 2048,
-    },
-}
-
-DEFAULT_MODEL = "Hash"
-CSS = """
-<style>
-:root {
-  --bg: #0E1020; --panel: rgba(255,255,255,.045); --line: rgba(255,255,255,.08);
-  --text: #FFFFFF; --muted: #CCCCCC; --amber: #F2A65A; --coral: #F27878; --indigo: #7C74FF;
-}
-.stApp {
-  color: var(--text);
-  background: radial-gradient(820px 520px at 88% -8%, rgba(242,166,90,.17), transparent 60%),
-              radial-gradient(760px 520px at -8% 6%, rgba(124,116,255,.20), transparent 58%), var(--bg);
-  font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-}
-.stApp p, .stApp li, .stApp label, .stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: var(--text); }
-.block-container { max-width: 100% !important; padding: 1.5rem 1rem 8rem 1rem !important; }
-header[data-testid="stHeader"] { background: transparent; }
-#MainMenu, footer { visibility: hidden; }
-.eq-hero { display: flex; align-items: center; gap: 16px; margin: .4rem 0 1rem; }
-.eq-mark { width: 46px; height: 46px; border-radius: 50%; flex: none; background: linear-gradient(90deg, var(--amber) 50%, #24284A 50%); box-shadow: 0 0 0 1px rgba(255,255,255,.14), 0 0 28px rgba(242,166,90,.28); }
-.eq-title { font-family: "Fraunces", Georgia, "Times New Roman", serif; font-style: italic; font-size: 2.15rem; background: linear-gradient(100deg, #FFD9A8, var(--amber) 45%, var(--coral)); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.eq-pill { -webkit-text-fill-color: var(--muted); font-family: sans-serif; font-style: normal; font-size: .62rem; border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; margin-left: 8px; }
-.eq-sub { color: var(--muted); font-size: .88rem; }
-.eq-empty { text-align: center; margin: 3.2rem 0 1.6rem; }
-.eq-empty .big { font-family: "Fraunces", Georgia, "Times New Roman", serif; font-style: italic; font-size: 1.55rem; }
-.eq-empty .small { color: var(--muted); font-size: .86rem; }
-[data-testid="stChatMessage"] { background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 14px 18px; margin: 0 2% .7rem 0; line-height: 1.7; }
-[data-testid="stChatMessage"]:has(.eq-user) { flex-direction: row-reverse; margin: 0 0 .7rem 2%; background: linear-gradient(135deg, rgba(242,166,90,.20), rgba(242,120,120,.12)); border-color: rgba(242,166,90,.30); }
-[data-testid="stElementContainer"]:has(.eq-user), [data-testid="element-container"]:has(.eq-user) { display: none; }
-[data-testid^="stChatMessageAvatar"] { background: rgba(255,255,255,.07); }
-[data-testid="stBottom"] { background: linear-gradient(to top, var(--bg) 55%, transparent); }
-[data-testid="stChatInput"] { background: rgba(23,26,46,.92); border: 1px solid rgba(255,255,255,.12); border-radius: 999px; }
-[data-testid="stChatInput"]:focus-within { border-color: rgba(242,166,90,.7); box-shadow: 0 0 0 4px rgba(242,166,90,.12); }
-[data-testid="stChatInput"] textarea { color: var(--text); }
-[data-testid="stChatInput"] button { background: var(--amber); color: #1A1326; }
-.stButton > button, [data-testid="stPopover"] > button, [data-testid="stPopoverButton"] { border-radius: 999px; border: 1px solid rgba(255,255,255,.14); background: var(--panel); color: var(--text); }
-.stButton > button:hover, [data-testid="stPopover"] > button:hover, [data-testid="stPopoverButton"]:hover { border-color: var(--amber); color: #FFD9A8; background: rgba(242,166,90,.08); }
-section[data-testid="stSidebar"] { background: #12142A; }
-.eq-side-title { font-family: "Fraunces", Georgia, "Times New Roman", serif; font-style: italic; font-size: 1.25rem; color: var(--amber); }
-.eq-side-sub { color: var(--muted); font-size: .8rem; margin-bottom: 1rem; }
-</style>
-"""
-
-st.markdown(CSS, unsafe_allow_html=True)
-# ====== 密码门 ======
-if not st.session_state.get("pwd_ok"):
-    st.markdown("### 🔒 先对一下暗号")
-
-    with st.form("gate"):
-        pwd = st.text_input("悄悄告诉我暗号：", type="password")
-        submitted = st.form_submit_button("进入")
-
-    if submitted:
-        if hmac.compare_digest(
-            pwd.encode(),
-            str(PASSWORD).encode(),
-        ):
-            st.session_state.pwd_ok = True
-            st.rerun()
-        else:
-            st.error("暗号不对诶，再想想？")
-
-    st.stop()
+@st.cache_resource
+def get_jobs():
+    """跨会话共享的生成任务表：{job_id: {...}}。"""
+    return {}
+# ====== Supabase（REST 接口） ======
+def sb_ok():
+    return bool(SB_URL and SB_KEY)
 
 
-st.markdown(
-    '<div class="eq-hero"><div class="eq-mark"></div><div>'
-    '<div class="eq-title">Equinox<span class="eq-pill">Hash 1.0</span></div>'
-    '<div class="eq-sub">昼夜平分 • Sol.调制</div></div></div>',
-    unsafe_allow_html=True,
-)
+def sb(method, table, params=None, body=None):
+    r = requests.request(
+        method, f"{SB_URL}/rest/v1/{table}", params=params, json=body, timeout=8,
+        headers={
+            "apikey": SB_KEY,
+            "Authorization": f"Bearer {SB_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    r.raise_for_status()
+    return r.json() if method == "GET" else None
 
 
-# ====== 基础工具 ======
+def today_start():
+    return datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def db_sessions(user):
+    """历史对话列表：按最近活跃排序，标题取每个会话的第一句话。"""
+    rows = sb("GET", "chats", {
+        "username": f"eq.{user}", "role": "eq.user",
+        "select": "session_id,content,created_at",
+        "order": "created_at.desc", "limit": "300",
+    })
+    seen = {}
+    for r in rows:
+        sid = r["session_id"]
+        if sid not in seen:                 # 倒序遍历，第一次见到的是最新
+            seen[sid] = {"id": sid, "title": ""}
+        seen[sid]["title"] = r["content"].strip().replace("\n", " ")[:30]  # 不断覆盖，最终是最早一句
+    return list(seen.values())
+
+
+def db_load(user, sid):
+    rows = sb("GET", "chats", {
+        "username": f"eq.{user}", "session_id": f"eq.{sid}",
+        "select": "role,content,model", "order": "created_at.asc,id.asc", "limit": "500",
+    })
+    return [{"role": r["role"], "content": r["content"], "model": r.get("model") or ""} for r in rows]
+
+
+def db_delete(user, sid):
+    sb("DELETE", "chats", {"username": f"eq.{user}", "session_id": f"eq.{sid}"})
+
+
+def db_used(user):
+    """今天已用的「受限模型」token 数。"""
+    rows = sb("GET", "chats", {
+        "username": f"eq.{user}", "created_at": f"gte.{today_start()}",
+        "select": "model,tokens", "limit": "5000",
+    })
+    limited = {m["name"] for m in MODELS if m["limited"]}
+    return sum(int(r.get("tokens") or 0) for r in rows if r.get("model") in limited)
+
+
+def db_overview():
+    """管理员用：所有人今天的用量。"""
+    rows = sb("GET", "chats", {
+        "created_at": f"gte.{today_start()}",
+        "select": "username,role,model,tokens", "limit": "10000",
+    })
+    limited = {m["name"] for m in MODELS if m["limited"]}
+    agg = {u: {"user": u, "asks": 0, "limited": 0, "total": 0} for u in USERS}
+    for r in rows:
+        a = agg.setdefault(r["username"], {"user": r["username"], "asks": 0, "limited": 0, "total": 0})
+        tk = int(r.get("tokens") or 0)
+        a["total"] += tk
+        if r.get("role") == "user":
+            a["asks"] += 1
+        if r.get("model") in limited:
+            a["limited"] += tk
+    for a in agg.values():
+        a["limit"] = "∞" if a["user"] in UNLIMITED_USERS else DAILY_TOKEN_LIMIT
+    return list(agg.values())
+
+
+# ====== 飞书推送 ======
+def feishu_payload(body):
+    payload = {"msg_type": "text", "content": {"text": body}}
+    if FEISHU_SECRET:
+        ts = str(int(time.time()))
+        digest = hmac.new(f"{ts}\n{FEISHU_SECRET}".encode(), digestmod=hashlib.sha256).digest()
+        payload["timestamp"] = ts
+        payload["sign"] = base64.b64encode(digest).decode()
+    return payload
+
+
+def _post_feishu(payload):
+    try:
+        requests.post(FEISHU_WEBHOOK, json=payload, timeout=5)
+    except Exception:
+        pass   # 推送失败不影响聊天
+
+
+def notify_feishu(role, text, model, user, sid):
+    """异步推送，不用 session_state，后台线程里也能调。"""
+    if not FEISHU_WEBHOOK or not text:
+        return
+    who = f"🙂 {user}" if role == "user" else "🌗 Equinox"
+    body = f"【Equinox】{who} · {model} · #{sid[:6]}\n{text[:3000]}"
+    threading.Thread(target=_post_feishu, args=(feishu_payload(body),), daemon=True).start()
+# ====== 调用模型（后台线程，流式） ======
 class ApiError(Exception):
     def __init__(self, status):
         super().__init__(f"HTTP {status}")
         self.status = status
 
 
-class MissingKey(Exception):
-    def __init__(self, secret_name):
-        super().__init__(secret_name)
-        self.secret_name = secret_name
+def api_error_text(status):
+    if status in (401, 403):
+        return "中转站 Key 无效或没权限，请检查 Secrets。"
+    if status == 404:
+        return "找不到这个模型，请检查 Secrets 里该模型的 id。"
+    if status == 400:
+        return "请求被拒绝（400），可能是型号名不对，或内容被拦截。"
+    if status == 429:
+        return "请求太频繁，或中转站余额不足，稍后再试。"
+    return f"服务器开小差了（{status}），稍后再试。"
 
 
-@st.cache_resource
-def get_session(key):
-    """按 Key 复用连接池。"""
-    s = requests.Session()
-    s.headers.update({"Authorization": f"Bearer {key}"})
-
-    retry = Retry(
-        connect=2,
-        read=0,
-        status=0,
-        redirect=0,
-        backoff_factor=0.3,
-    )
-
-    s.mount(
-        "https://",
-        requests.adapters.HTTPAdapter(
-            pool_connections=4,
-            pool_maxsize=20,
-            max_retries=retry,
-        ),
-    )
-
-    return s
-
-
-def _warm(session, url):
+def run_job(job, url, key, body_base, meta):
+    """
+    后台线程：边读模型的流式输出边写进 job["text"]，前端轮询读取。
+    结束后自己存档到 Supabase、推送飞书，所以用户关掉网页也不丢。
+    注意：线程里不能碰 st.session_state。
+    """
+    usage = None
     try:
-        session.head(url, timeout=3)
+        for attempt in (0, 1):
+            body = dict(body_base)
+            if attempt == 0:
+                body["stream_options"] = {"include_usage": True}   # 让中转站返回真实 token 用量
+            with requests.post(
+                url, headers={"Authorization": f"Bearer {key}"},
+                json=body, stream=True, timeout=(8, 90),
+            ) as res:
+                if res.status_code == 400 and attempt == 0:
+                    continue        # 个别中转站不认 stream_options，去掉重试一次
+                if res.status_code != 200:
+                    raise ApiError(res.status_code)
+                for raw in res.iter_lines(chunk_size=None):
+                    if job["stop"]:
+                        break
+                    if not raw or not raw.startswith(b"data:"):
+                        continue
+                    payload = raw[5:].strip()
+                    if payload == b"[DONE]":
+                        break
+                    try:
+                        obj = json.loads(payload)
+                    except ValueError:
+                        continue
+                    if obj.get("usage"):
+                        usage = obj["usage"]
+                    choices = obj.get("choices") or []
+                    if not choices:
+                        continue
+                    piece = (choices[0].get("delta") or {}).get("content")
+                    if piece:
+                        job["text"] += piece
+            break
+    except ApiError as e:
+        job["error"] = api_error_text(e.status)
     except Exception:
-        pass
+        job["error"] = "网络好像断了一下，再发一次试试。"
+    finally:
+        text = job["text"]
+        if text:
+            tk = int((usage or {}).get("completion_tokens") or est_tokens(text))
+            if sb_ok():
+                try:
+                    sb("POST", "chats", body=[{
+                        "username": meta["user"], "session_id": meta["sid"], "role": "assistant",
+                        "content": text, "model": meta["model"], "tokens": tk,
+                    }])
+                except Exception:
+                    job["save_failed"] = True
+            notify_feishu("assistant", text, meta["model"], meta["user"], meta["sid"])
+        job["done"] = True
+# ====== 会话状态 ======
+def notify(text, restore=None):
+    """给前端弹一个提示；restore 表示把没发出去的文字还给输入框。"""
+    st.session_state.notice = {"id": uuid.uuid4().hex, "text": text, "restore": restore}
 
 
-if not st.session_state.get("warmed"):
-    st.session_state.warmed = True
-
-    for _p in PROVIDERS.values():
-        _k = get_secret(_p["secret"])
-
-        if _k:
-            threading.Thread(
-                target=_warm,
-                args=(get_session(_k), _p["url"]),
-                daemon=True,
-            ).start()
+def detach_job():
+    """切换会话/退出时，停掉当前生成任务。"""
+    jid = st.session_state.pop("job_id", None)
+    if jid:
+        job = get_jobs().pop(jid, None)
+        if job:
+            job["stop"] = True
 
 
-# ====== 飞书推送函数 ======
-def _feishu_payload(body):
-    payload = {
-        "msg_type": "text",
-        "content": {"text": body},
+def new_chat():
+    detach_job()
+    st.session_state.sid = uuid.uuid4().hex
+    st.session_state.messages = []
+
+
+def sync_job():
+    """每次运行时检查生成任务：完成则把回复并入当前对话。返回仍在进行的 job。"""
+    ss = st.session_state
+    jid = ss.get("job_id")
+    if not jid:
+        return None
+    job = get_jobs().get(jid)
+    if job is None:
+        ss.pop("job_id", None)
+        return None
+    if not job["done"]:
+        return job
+    if job["text"]:
+        ss.messages.append({"role": "assistant", "content": job["text"], "model": job["model"]})
+    if job["error"]:
+        notify(job["error"])
+    elif job.get("save_failed"):
+        notify("这条回复没能存档，刷新后可能丢失。")
+    get_jobs().pop(jid, None)
+    ss.pop("job_id", None)
+    ss.dirty = True
+    return None
+
+
+def refresh_side(user):
+    """刷新历史列表和今日用量。"""
+    ss = st.session_state
+    if not sb_ok():
+        ss.sessions, ss.used = [], 0
+        return
+    try:
+        ss.sessions = db_sessions(user)
+        ss.used = db_used(user)
+    except Exception:
+        notify("读取历史/额度失败，请检查 Supabase 配置。")
+
+
+# ====== 事件处理（前端点了什么，在这里响应） ======
+def do_login(u, p):
+    ss = st.session_state
+    left = ss.get("locked_until", 0) - time.time()
+    if left > 0:
+        ss.login_err = f"尝试次数太多，请 {int(left) + 1} 秒后再试。"
+        return True
+    key = USERS_L.get(str(u).strip().lower())
+    real = USERS.get(key, "\x00") if key else "\x00"
+    ok = hmac.compare_digest(str(p).encode(), real.encode()) and key is not None
+    if ok:
+        ss.update(username=key, login_err="", fails=0, dirty=True)
+        new_chat()
+    else:
+        ss.fails = ss.get("fails", 0) + 1
+        if ss.fails >= 5:                       # 连错 5 次锁 5 分钟
+            ss.locked_until = time.time() + 300
+            ss.fails = 0
+        ss.login_err = "用户名或密码不对。"
+    return True
+
+
+def on_send(text, model_name):
+    ss = st.session_state
+    user = ss.username
+    text = (text or "").strip()
+    if not text or ss.get("job_id"):
+        return False
+    spec = MODEL_MAP.get(model_name)
+    if not spec:
+        notify("没有这个模型。", text)
+        return True
+    if not (RELAY_BASE_URL and RELAY_API_KEY):
+        notify("中转站还没配置（RELAY_BASE_URL / RELAY_API_KEY）。", text)
+        return True
+
+    # 额度检查：只限制「受限模型」，无限额度账号跳过
+    if spec["limited"] and user not in UNLIMITED_USERS:
+        if not sb_ok():
+            notify("没配置 Supabase，无法统计额度。", text)
+            return True
+        try:
+            used = db_used(user)
+        except Exception:
+            notify("额度服务暂时不可用，请稍后再试。", text)
+            return True
+        if used >= DAILY_TOKEN_LIMIT:
+            notify(f"今天的额度用完了（{used}/{DAILY_TOKEN_LIMIT} tokens），明天恢复；也可以换 GLM / DeepSeek。", text)
+            return True
+
+    # 记录并存档用户消息
+    ss.messages.append({"role": "user", "content": text, "model": model_name})
+    if sb_ok():
+        try:
+            sb("POST", "chats", body=[{
+                "username": user, "session_id": ss.sid, "role": "user",
+                "content": text, "model": model_name, "tokens": est_tokens(text),
+            }])
+        except Exception:
+            notify("这条消息没能存档，刷新后可能丢失。")
+    notify_feishu("user", text, model_name, user, ss.sid)
+
+    # 组装上下文：人设（可空）+ 最近 N 条
+    ctx = [{"role": m["role"], "content": m["content"]} for m in ss.messages][-MAX_CONTEXT:]
+    if SYSTEM_PROMPT.strip():
+        ctx = [{"role": "system", "content": SYSTEM_PROMPT}] + ctx
+    body = {
+        "model": spec["id"], "messages": ctx, "stream": True,
+        "temperature": spec["temp"], "max_tokens": spec["max_tokens"],
     }
 
-    if FEISHU_SECRET:
-        ts = str(int(time.time()))
-
-        # 飞书自定义机器人签名算法
-        string_to_sign = f"{ts}\n{FEISHU_SECRET}"
-
-        digest = hmac.new(
-            string_to_sign.encode("utf-8"),
-            digestmod=hashlib.sha256,
-        ).digest()
-
-        payload["timestamp"] = ts
-        payload["sign"] = base64.b64encode(digest).decode("utf-8")
-
-    return payload
-
-
-def _post_feishu(url, payload):
-    try:
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=5,
-        )
-        response.raise_for_status()
-    except Exception:
-        # 飞书推送失败，不影响聊天
-        pass
-
-
-def notify_feishu(role, text, model_name):
-    """异步推送消息到飞书群。"""
-    if not FEISHU_WEBHOOK or not text:
-        return
-
-    who = "🙂 用户" if role == "user" else "🌗 Equinox"
-
-    tag = (
-        "(管理员)"
-        if st.session_state.get("is_admin")
-        else ""
-    )
-
-    sid = st.session_state.setdefault(
-        "sid",
-        uuid.uuid4().hex[:6],
-    )
-
-    body = (
-        f"【Equinox】{who}{tag} · {model_name} · #{sid}\n"
-        f"{text[:3000]}"
-    )
-
-    payload = _feishu_payload(body)
-
+    job = {"text": "", "done": False, "error": None, "stop": False, "model": model_name}
+    jid = uuid.uuid4().hex
+    get_jobs()[jid] = job
     threading.Thread(
-        target=_post_feishu,
-        args=(FEISHU_WEBHOOK, payload),
+        target=run_job,
+        args=(job, chat_url(), RELAY_API_KEY, body, {"user": user, "sid": ss.sid, "model": model_name}),
         daemon=True,
     ).start()
+    ss.job_id = jid
+    ss.dirty = True
+    return True
 
 
-def cfg(key, default):
-    """管理员模式下使用覆盖值。"""
-    if st.session_state.get("is_admin"):
-        return st.session_state.get(key, default)
+def handle(ev):
+    """处理前端事件；返回 True 表示需要重新渲染。"""
+    ss = st.session_state
+    t = ev.get("type")
+    if t == "login":
+        return do_login(ev.get("u", ""), ev.get("p", ""))
+    user = ss.get("username")
+    if not user or t == "poll":
+        return False
 
-    return default
+    if t == "send":
+        return on_send(ev.get("text"), ev.get("model"))
+    if t == "stop":
+        job = get_jobs().get(ss.get("job_id"))
+        if job:
+            job["stop"] = True
+        return False
+    if t == "new":
+        new_chat()
+        ss.dirty = True
+        return True
+    if t == "open":
+        sid = ev.get("sid")
+        if sid and sid != ss.sid:
+            if not sb_ok():
+                return False
+            try:
+                rows = db_load(user, sid)
+            except Exception:
+                notify("读取对话失败。")
+                return True
+            detach_job()
+            ss.sid, ss.messages = sid, rows
+        return True
+    if t == "delete":
+        sid = ev.get("sid")
+        try:
+            db_delete(user, sid)
+        except Exception:
+            notify("删除失败。")
+            return True
+        if sid == ss.sid:
+            new_chat()
+        ss.dirty = True
+        return True
+    if t == "logout":
+        eid = ss.get("last_eid")      # 保留事件 id，否则会重复处理退出事件陷入循环
+        detach_job()
+        ss.clear()
+        ss["last_eid"] = eid
+        return True
 
-
-def get_persona(name):
-    """管理员使用管理员人设，普通访客使用模型默认人设。"""
-    if st.session_state.get("is_admin"):
-        return st.session_state.get(
-            f"persona_{name}",
-            ADMIN_PERSONA,
-        )
-
-    return MODELS[name]["persona"]
-
-
-def resolve_model():
-    """解析当前模型配置。"""
-    if st.session_state.get("is_admin"):
-        st.session_state.model_choice = "Hash"
-
-    st.session_state.setdefault(
-        "model_choice",
-        DEFAULT_MODEL,
-    )
-
-    name = st.session_state.model_choice
-
-    if name not in MODELS:
-        name = st.session_state.model_choice = DEFAULT_MODEL
-
-    spec = MODELS[name]
-    prov = PROVIDERS[spec["provider"]]
-
-    model_id = (
-        cfg(f"adm_model_{name}", spec["model"])
-        or spec["model"]
-    )
-
-    temperature = float(
-        cfg(f"adm_temp_{name}", spec["temp"])
-    )
-
-    max_tokens = int(
-        cfg(f"adm_tokens_{name}", spec["max_tokens"])
-    )
-
-    return (
-        name,
-        prov["url"],
-        get_secret(prov["secret"]),
-        prov["secret"],
-        model_id,
-        temperature,
-        max_tokens,
-    )
-
-
-def init_chat():
-    cur = st.session_state.get(
-        "model_choice",
-        DEFAULT_MODEL,
-    )
-
-    st.session_state.messages = [
-        {
-            "role": "system",
-            "content": get_persona(cur),
-        }
-    ]
-
-    st.session_state.starters = random.sample(
-        STARTER_POOL,
-        4,
-    )
+    # ---- 管理员 ----
+    if user in ADMIN_USERS:
+        if t in ("admin_open", "admin_refresh"):
+            try:
+                ss.admin = {"rows": db_overview(), "msg": ""}
+            except Exception:
+                ss.admin = {"rows": [], "msg": "读取用量失败，请检查 Supabase。"}
+            return True
+        if t == "admin_close":
+            ss.admin = None
+            return True
+        if t == "feishu_test":
+            msg = "还没配置 FEISHU_WEBHOOK。"
+            if FEISHU_WEBHOOK:
+                try:
+                    r = requests.post(FEISHU_WEBHOOK, json=feishu_payload("【Equinox】飞书推送测试"), timeout=5)
+                    msg = f"HTTP {r.status_code}：{r.text[:120]}"
+                except Exception as e:
+                    msg = f"请求失败：{type(e).__name__}"
+            ss.admin = dict(ss.get("admin") or {"rows": []}, msg=msg)
+            return True
+    return False
 
 
-def render_message(role, content):
-    with st.chat_message(
-        role,
-        avatar=AVATARS[role],
-    ):
-        if role == "user":
-            st.markdown(
-                '<span class="eq-user"></span>',
-                unsafe_allow_html=True,
-            )
+# ====== 构造发给前端的状态 ======
+def build_state():
+    ss = st.session_state
+    ss.tick = ss.get("tick", 0) + 1       # 保证每次 args 都不同，前端才会收到渲染事件
+    user = ss.get("username")
+    if not user:
+        return {"view": "login", "tick": ss.tick, "err": ss.get("login_err", "")}
 
-        st.markdown(content)
-# ====== 流式对话 ======
-def stream_response(
-    messages,
-    url,
-    key,
-    model_id,
-    temperature,
-    max_tokens,
-):
-    data = {
-        "model": model_id,
-        "messages": messages,
-        "stream": True,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+    job = sync_job()
+    if ss.pop("dirty", False):
+        refresh_side(user)
+    return {
+        "view": "chat", "tick": ss.tick, "user": user,
+        "is_admin": user in ADMIN_USERS,
+        "models": [{"name": m["name"], "desc": m["desc"], "limited": m["limited"]} for m in MODELS],
+        "limit": None if user in UNLIMITED_USERS else DAILY_TOKEN_LIMIT,
+        "used": ss.get("used", 0),
+        "sessions": ss.get("sessions", []),
+        "sid": ss.get("sid"),
+        "messages": ss.get("messages", []),
+        "generating": bool(job),
+        "stream": job["text"] if job else "",
+        "notice": ss.get("notice"),
+        "admin": ss.get("admin"),
     }
 
-    with get_session(key).post(
-        url,
-        json=data,
-        stream=True,
-        timeout=(8, 30),
-    ) as res:
 
-        if res.status_code != 200:
-            raise ApiError(res.status_code)
 
-        buf = []
-        last = time.monotonic()
-
-        for raw in res.iter_lines(chunk_size=None):
-            if not raw or not raw.startswith(b"data:"):
-                continue
-
-            payload = raw[5:].strip()
-
-            if payload == b"[DONE]":
-                break
-
-            try:
-                delta = json.loads(payload)["choices"][0]["delta"]
-            except (
-                ValueError,
-                KeyError,
-                IndexError,
-                TypeError,
-            ):
-                continue
-
-            piece = delta.get("content")
-
-            if not piece:
-                continue
-
-            buf.append(piece)
-
-            now = time.monotonic()
-
-            if now - last >= FLUSH_INTERVAL:
-                yield "".join(buf)
-                buf.clear()
-                last = now
-
-        if buf:
-            yield "".join(buf)
-
-
-def stream_to(
-    box,
-    messages,
-    url,
-    key,
-    model_id,
-    temperature,
-    max_tokens,
-):
-    text = ""
-
-    for piece in stream_response(
-        messages,
-        url,
-        key,
-        model_id,
-        temperature,
-        max_tokens,
-    ):
-        text += piece
-        box.markdown(text + "▌")
-
-    if not text:
-        raise RuntimeError("empty reply")
-
-    box.markdown(text)
-
-    return text
-
-
-# ====== 模型选择器 ======
-def model_picker():
-    st.session_state.setdefault(
-        "model_choice",
-        DEFAULT_MODEL,
-    )
-
-    locked = bool(
-        st.session_state.get("is_admin")
-    )
-
-    with st.popover(
-        f"🌗 {st.session_state.model_choice}  ▾"
-    ):
-        if locked:
-            st.caption("管理员模式下固定使用 Hash")
-
-        st.radio(
-            "选择模型",
-            list(MODELS),
-            key="model_choice",
-            format_func=lambda n: (
-                f"{n} · {MODELS[n]['desc']}"
-            ),
-            label_visibility="collapsed",
-            disabled=locked,
-        )
-# ====== 管理员面板 ======
-def _apply_persona(name):
-    st.session_state[f"persona_{name}"] = (
-        st.session_state[f"adm_persona_{name}"]
-    )
-
-
-def _reset_persona(name):
-    st.session_state.pop(
-        f"persona_{name}",
-        None,
-    )
-
-    st.session_state[f"adm_persona_{name}"] = ADMIN_PERSONA
-
-
-def admin_panel(msgs, name):
-    with st.expander("🛠 管理员模式"):
-
-        if not st.session_state.get("is_admin"):
-            pw = st.text_input(
-                "管理员口令",
-                type="password",
-                key="admin_pw",
-            )
-
-            if st.button("验证", key="admin_login"):
-                if hmac.compare_digest(
-                    pw.encode(),
-                    str(ADMIN_PASSWORD).encode(),
-                ):
-                    st.session_state.is_admin = True
-                    st.rerun()
-                else:
-                    st.error("口令不对。")
-
-            return
-
-        spec = MODELS[name]
-
-        st.caption(
-            f"下面的修改只对「{name}」在你当前这个会话生效，"
-            "刷新页面就恢复默认。"
-        )
-
-        st.text_input(
-            "实际型号",
-            value=spec["model"],
-            key=f"adm_model_{name}",
-        )
-
-        st.slider(
-            "temperature",
-            0.0,
-            1.5,
-            float(spec["temp"]),
-            0.1,
-            key=f"adm_temp_{name}",
-        )
-
-        st.number_input(
-            "记忆条数（所有模型共用）",
-            min_value=2,
-            max_value=100,
-            value=MAX_CONTEXT,
-            step=2,
-            key="adm_ctx",
-        )
-
-        st.number_input(
-            "单次回复上限（token）",
-            min_value=64,
-            max_value=8192,
-            value=int(spec["max_tokens"]),
-            step=64,
-            key=f"adm_tokens_{name}",
-        )
-
-        st.text_area(
-            "人设（system prompt）",
-            value=get_persona(name),
-            height=220,
-            key=f"adm_persona_{name}",
-        )
-
-        c1, c2 = st.columns(2)
-
-        c1.button(
-            "应用人设",
-            key="adm_apply",
-            on_click=_apply_persona,
-            args=(name,),
-            use_container_width=True,
-        )
-
-        c2.button(
-            "恢复默认",
-            key="adm_reset",
-            on_click=_reset_persona,
-            args=(name,),
-            use_container_width=True,
-        )
-
-        hist = msgs[1:]
-
-        st.caption(
-            f"当前会话：{len(hist)} 条消息，"
-            f"约 {sum(len(m['content']) for m in hist)} 字"
-        )
-
-        st.download_button(
-            "导出聊天记录",
-            data=json.dumps(
-                hist,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            file_name="equinox_chat.json",
-            mime="application/json",
-            key="adm_export",
-            use_container_width=True,
-        )
-
-        # ====== 飞书推送测试 ======
-        if st.button(
-            "测试飞书推送",
-            key="adm_feishu",
-            use_container_width=True,
-        ):
-            if not FEISHU_WEBHOOK:
-                st.warning(
-                    "还没配置 FEISHU_WEBHOOK。"
-                )
-            else:
-                try:
-                    response = requests.post(
-                        FEISHU_WEBHOOK,
-                        json=_feishu_payload(
-                            "【Equinox】飞书推送测试"
-                        ),
-                        timeout=5,
-                    )
-
-                    st.caption(
-                        f"HTTP 状态码：{response.status_code}"
-                    )
-
-                    st.code(response.text[:500])
-
-                    if response.ok:
-                        try:
-                            result = response.json()
-
-                            if result.get("code", 0) == 0:
-                                st.success("飞书推送成功。")
-                            else:
-                                st.error(
-                                    f"飞书返回错误：{result}"
-                                )
-                        except ValueError:
-                            st.warning(
-                                "服务器已响应，但返回内容不是 JSON。"
-                            )
-                    else:
-                        st.error("飞书请求失败。")
-
-                except Exception as e:
-                    st.error(
-                        f"请求失败：{type(e).__name__}"
-                    )
-
-        if st.button(
-            "退出管理员",
-            key="adm_logout",
-            use_container_width=True,
-        ):
-            st.session_state.is_admin = False
-            st.rerun()
-# ====== 初始化 & 侧边栏 ======
-if "messages" not in st.session_state:
-    init_chat()
-
-(
-    name,
-    url,
-    key,
-    secret_name,
-    model_id,
-    temperature,
-    max_tokens,
-) = resolve_model()
-
-st.session_state.messages[0]["content"] = get_persona(name)
-
-max_context = int(
-    cfg("adm_ctx", MAX_CONTEXT)
-)
-
-with st.sidebar:
-    st.markdown(
-        '<div class="eq-side-title">Equinox</div>'
-        '<div class="eq-side-sub">昼夜平分，我一直在。</div>',
-        unsafe_allow_html=True,
-    )
-
-    if st.button(
-        "🗑️  清空记忆",
-        use_container_width=True,
-    ):
-        init_chat()
-        st.rerun()
-
-    st.caption(f"当前模型：{name}")
-
-
-# 模型选择器放在聊天区顶部
-model_picker()
-
-
-# ====== 本轮输入 ======
-prompt = st.chat_input("想说什么都可以……")
-
-if not prompt:
-    prompt = st.session_state.pop("pending", None)
-
-msgs = st.session_state.messages
-history = msgs[1:]
-
-
-# ====== 空状态 / 历史 ======
-if not history and not prompt:
-    st.markdown(
-        '<div class="eq-empty"><div class="big">你来啦。</div>'
-        '<div class="small">想聊什么都可以，我在这儿。</div></div>',
-        unsafe_allow_html=True,
-    )
-
-    cols = st.columns(2)
-
-    for i, starter in enumerate(
-        st.session_state.starters
-    ):
-        cols[i % 2].button(
-            starter,
-            key=f"btn_{i}",
-            on_click=lambda t=starter: (
-                st.session_state.update({"pending": t})
-            ),
-            use_container_width=True,
-        )
-
-
-for m in history:
-    render_message(
-        m["role"],
-        m["content"],
-    )
-
-
-# ====== 处理新输入 ======
-if prompt:
-    msgs.append(
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    )
-
-    # 保留最近的对话
-    if len(msgs) > max_context + 1:
-        msgs[1:] = msgs[-max_context:]
-
-    # 推送用户消息到飞书
-    notify_feishu(
-        "user",
-        prompt,
-        name,
-    )
-
-    render_message(
-        "user",
-        prompt,
-    )
-
-    reply = ""
-
-    with st.chat_message(
-        "assistant",
-        avatar=AVATARS["assistant"],
-    ):
-        box = st.empty()
-
-        box.markdown("*唔…让我想想怎么回你…*")
-
-        try:
-            if not key:
-                raise MissingKey(secret_name)
-
-            reply = stream_to(
-                box,
-                msgs,
-                url,
-                key,
-                model_id,
-                temperature,
-                max_tokens,
-            )
-
-        except MissingKey as e:
-            box.empty()
-
-            st.error(
-                f"{name} 还没配置 Key，"
-                f"请在 Secrets 里加上 {e.secret_name}。"
-            )
-
-        except ApiError as e:
-            box.empty()
-
-            if e.status in (400, 429):
-                st.warning(
-                    "诶，我刚被拦了一下，可能是问得太快，"
-                    "或者话题有点敏感。等一会再试试？"
-                )
-
-            elif e.status in (401, 403):
-                st.error(
-                    f"{name} 的 API Key 好像有问题，"
-                    "检查一下 Secrets。"
-                )
-
-            else:
-                st.error(
-                    f"服务器好像开小差了（{e.status}），"
-                    "等一下再试试。"
-                )
-
-        except Exception:
-            box.empty()
-            st.error("网络好像断了一下，再发一次试试。")
-
-    if reply:
-        msgs.append(
-            {
-                "role": "assistant",
-                "content": reply,
-            }
-        )
-
-        # 推送完整回复到飞书
-        notify_feishu(
-            "assistant",
-            reply,
-            name,
-        )
-
-    else:
-        # 请求失败时移除刚刚添加的用户消息
-        if msgs and msgs[-1].get("role") == "user":
-            msgs.pop()
-
-
-# ====== 页面底部说明 ======
-st.markdown(
-    '<div style="text-align: center; color: #888888; '
-    'font-size: 0.75rem; margin-top: 1rem;">'
-    "Equinox 是 AI，偶尔也会说错，重要的事记得再确认一下。"
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-
-# ====== 管理员面板放在最后渲染 ======
-with st.sidebar:
-    st.divider()
-    admin_panel(msgs, name)
